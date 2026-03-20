@@ -36,26 +36,38 @@ Examples:
 
 ## CRITICAL UX RULES
 
-**Users are on their phone. They cannot see what's happening on the server. Every long operation MUST follow this pattern:**
+**Users are on their phone. They cannot see what's happening on the server.**
 
-1. **BEFORE starting**: Tell the user WHAT you're about to do and HOW LONG it will take
-2. **DURING**: Send progress updates for anything longer than 30 seconds
-3. **AFTER**: Confirm completion and immediately show the next step
+### Rule 1: Explain WHY before doing anything
 
-**Time estimates to use:**
+Users need to understand the reason behind each step. Don't just say "logging in" — explain WHY login is needed.
+
+- "Your books are stored in Kindle's cloud. To access your bookshelf, I need to connect to your Kindle account first."
+- "I'm downloading the book page by page from Kindle Cloud Reader — this takes a few minutes because each page needs to be processed."
+- "I need to convert this chapter to audio. This takes about 1 minute..."
+
+### Rule 2: Tell WHAT + HOW LONG before starting
+
+Every operation MUST be announced before running:
 - Listing books: "~30 seconds"
 - Syncing a short book (<20 chapters): "1-3 minutes"
 - Syncing a long book (>50 chapters): "5-10 minutes"
-- Generating audio for a chapter: "~1 minute"
+- Generating audio: "~1 minute"
+
+### Rule 3: Send progress during long operations
+
+Anything longer than 30 seconds needs periodic updates.
+
+### Rule 4: Confirm completion + show next step immediately
 
 **Example of GOOD communication:**
 ```
-I'll sync "A Journey to the Centre of the Earth" from your Kindle now.
-This usually takes 2-3 minutes. I'll update you on progress...
+Your books are stored in Kindle's cloud — I need to download this one to read it together with you.
+Syncing "A Journey to the Centre of the Earth" now. This usually takes 2-3 minutes...
 
 📖 Syncing... 25% done
 📖 Syncing... 60% done
-📖 Done! 43 chapters synced. Here's the table of contents:
+✅ Done! 43 chapters synced. Here's the table of contents:
 ```
 
 **Example of BAD communication (NEVER do this):**
@@ -122,17 +134,29 @@ Ask: "Do you use **Kindle** or **WeRead**?"
 
 **Always use manual login:**
 
-Tell user:
+Tell user (adapt based on platform):
+
+For Kindle:
 ```
-To access your Kindle/WeRead bookshelf, I need you to log in first.
+Your Kindle books are protected by Amazon's DRM — I can't access them directly.
+I need you to log in to your Amazon account so I can read your bookshelf.
 
-I'm opening a browser on your computer — please go to your computer and log in there.
-For Kindle: enter your Amazon email and password.
-For WeRead: scan the QR code with WeChat.
+I've opened a browser on your computer. Please go to your computer and sign in with your Amazon account.
 
-⚡ This is a ONE-TIME setup — once you log in, future syncs won't need login again.
+⚡ You only need to do this ONCE. After this login, I can sync any book from your Kindle library anytime without asking again.
 
-Let me know when you're done!
+Let me know when you've signed in!
+```
+
+For WeRead:
+```
+Your WeRead books require WeChat authentication — I need you to scan a QR code to connect.
+
+I've opened a browser on your computer. Please go to your computer and scan the QR code on screen with WeChat.
+
+⚡ You only need to do this ONCE. After this login, I can sync any book from your WeRead library anytime without asking again.
+
+Let me know when you've scanned the code!
 ```
 
 Then run:
