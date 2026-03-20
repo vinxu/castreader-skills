@@ -3,7 +3,7 @@ name: castreader
 description: >
   Read books together with AI. Pick a book from your Kindle or WeRead library,
   discuss chapter by chapter, and listen aloud.
-version: 3.1.0
+version: 3.1.3
 metadata:
   openclaw:
     emoji: "📖"
@@ -89,7 +89,7 @@ Syncing "A Journey to the Centre of the Earth" now. This usually takes 2-3 minut
 ### Show Local Book List
 
 ```
-cat ~/castreader-library/index.json
+cat ~/castreader-library/index.json 2>/dev/null || echo '{"books":[]}'
 ```
 
 Format as numbered list, then ask which one to read.
@@ -128,20 +128,22 @@ cat ~/castreader-library/books/<id>/chapter-NN.md
 
 Ask: "Do you use **Kindle** or **WeRead**?"
 
-### Step 2: Login
+### Step 2: Login + List books (ALWAYS do login check first)
+
+**IMPORTANT: ALWAYS run login first, even if user previously logged in. The login session may have expired or been cleared.**
 
 **IMPORTANT: Do NOT use the automated credential flow (sync-login.js input). It is unreliable — browser popups block it.**
 
 **Always use manual login:**
 
-Tell user (adapt based on platform):
+Tell user WHY login is needed (adapt based on platform):
 
 For Kindle:
 ```
 Your Kindle books are protected by Amazon's DRM — I can't access them directly.
 I need you to log in to your Amazon account so I can read your bookshelf.
 
-I've opened a browser on your computer. Please go to your computer and sign in with your Amazon account.
+I'm opening a browser on your computer now. Please go to your computer and sign in with your Amazon account.
 
 ⚡ You only need to do this ONCE. After this login, I can sync any book from your Kindle library anytime without asking again.
 
@@ -152,7 +154,7 @@ For WeRead:
 ```
 Your WeRead books require WeChat authentication — I need you to scan a QR code to connect.
 
-I've opened a browser on your computer. Please go to your computer and scan the QR code on screen with WeChat.
+I'm opening a browser on your computer now. Please go to your computer and scan the QR code on screen with WeChat.
 
 ⚡ You only need to do this ONCE. After this login, I can sync any book from your WeRead library anytime without asking again.
 
@@ -164,7 +166,7 @@ Then run:
 node scripts/sync-login.js <kindle|weread> start
 ```
 
-- If output has `"already_logged_in"` → Tell user "Already logged in!" and skip to Step 3
+- If output has `"already_logged_in"` → Tell user "Great, you're already logged in!" and continue to list books
 - If output has `"login_step"` → Browser is open, user needs to go log in
   - For WeRead: tell user "Scan the QR code with WeChat on your computer screen"
   - For Kindle: tell user "Enter your Amazon credentials in the browser on your computer"
@@ -179,9 +181,9 @@ When `loggedIn: true` → Tell user "Login successful!" then:
 node scripts/sync-login.js <kindle|weread> stop
 ```
 
-### Step 3: List books
+**After login confirmed**, list books:
 
-**Tell user first:** "Scanning your library, about 30 seconds..."
+**Tell user:** "Scanning your library, about 30 seconds..."
 
 ```
 node scripts/sync-books.js <kindle|weread> --list
@@ -193,7 +195,7 @@ Show numbered list to user, ask which one to read.
 
 **STOP and wait for user to pick.**
 
-### Step 4: Sync the selected book
+### Step 3: Sync the selected book
 
 **Tell user first:** "Syncing '[book title]' now. This takes about 2-5 minutes depending on the book length. I'll keep you updated on progress..."
 
