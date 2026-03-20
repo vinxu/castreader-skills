@@ -792,7 +792,29 @@ async function syncKindle(browser, extId, page, maxBooks, { listOnly = false, bo
 
     // Wait for sync to complete
     process.stderr.write(`  Sync started. Waiting for completion...\n`);
-    const syncResult = await waitForSyncComplete(browser, extId, book.title, page);
+    let syncResult = await waitForSyncComplete(browser, extId, book.title, page);
+
+    // Auto-retry once on failure (checkpoint resume skips already-synced pages)
+    if (!syncResult.success && syncResult.error !== 'cancelled') {
+      process.stderr.write(`  ⚠ Sync interrupted (${syncResult.error}). Retrying with checkpoint resume...\n`);
+
+      // Reload the reader page to reset extension state
+      await page.reload({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+      await sleep(5000);
+      await page.bringToFront();
+
+      // Re-trigger sync (extension will resume from checkpoint)
+      let retriggered = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const result = await sendMessageToActiveTab(browser, extId, { type: 'SYNC_LIBRARY_START' }, page);
+        if (result.success) { retriggered = true; break; }
+        await sleep(3000);
+      }
+
+      if (retriggered) {
+        syncResult = await waitForSyncComplete(browser, extId, book.title, page);
+      }
+    }
 
     if (syncResult.success) {
       booksSynced++;
