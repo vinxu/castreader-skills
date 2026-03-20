@@ -116,8 +116,10 @@ function ensureDependencies() {
   puppeteer = require('puppeteer');
 }
 
+const EXTENSION_REPO = 'https://github.com/vinxu/castreader-extension.git';
+
 function ensureExtensionBuilt() {
-  // Priority: env var > dev build > bundled
+  // Priority: env var > dev build > bundled > download from GitHub > build from source
   if (process.env.CASTREADER_EXT_PATH) {
     const p = process.env.CASTREADER_EXT_PATH;
     if (fs.existsSync(path.join(p, 'manifest.json'))) return p;
@@ -131,15 +133,34 @@ function ensureExtensionBuilt() {
     return DEV_EXT_PATH;
   }
 
-  // Bundled extension (shipped with skill, works on any machine)
+  // Bundled extension (shipped with skill or previously downloaded)
   if (fs.existsSync(path.join(BUNDLED_EXT_PATH, 'manifest.json'))) {
     process.stderr.write('Using bundled extension.\n');
     return BUNDLED_EXT_PATH;
   }
 
-  // Neither exists — try building from source
+  // Download from GitHub (extension not bundled with skill to keep package small)
+  process.stderr.write('Extension not found locally. Downloading from GitHub...\n');
+  try {
+    execSync(`git clone --depth 1 ${EXTENSION_REPO} "${BUNDLED_EXT_PATH}"`, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    // Remove .git dir to save space
+    const gitDir = path.join(BUNDLED_EXT_PATH, '.git');
+    if (fs.existsSync(gitDir)) {
+      fs.rmSync(gitDir, { recursive: true, force: true });
+    }
+    if (fs.existsSync(path.join(BUNDLED_EXT_PATH, 'manifest.json'))) {
+      process.stderr.write('Extension downloaded successfully.\n');
+      return BUNDLED_EXT_PATH;
+    }
+  } catch (e) {
+    process.stderr.write(`Download failed: ${e.message}\n`);
+  }
+
+  // Fallback: try building from source
   if (fs.existsSync(READOUT_DESKTOP)) {
-    process.stderr.write('Extension not built. Building now...\n');
+    process.stderr.write('Building extension from source...\n');
     const nodeModules = path.join(READOUT_DESKTOP, 'node_modules');
     if (!fs.existsSync(nodeModules)) {
       execSync('pnpm install', { cwd: READOUT_DESKTOP, stdio: 'inherit' });
@@ -151,7 +172,7 @@ function ensureExtensionBuilt() {
   }
 
   console.error('Error: Chrome extension not found.');
-  console.error('The bundled extension is missing from the skill directory.');
+  console.error('Try: git clone https://github.com/vinxu/castreader-extension.git chrome-extension');
   process.exit(1);
 }
 
