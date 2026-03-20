@@ -3,7 +3,7 @@ name: castreader
 description: >
   Read books together with AI. Pick a book from your Kindle or WeRead library,
   discuss chapter by chapter, and listen aloud.
-version: 3.0.0
+version: 3.0.1
 metadata:
   openclaw:
     emoji: "📖"
@@ -13,7 +13,7 @@ metadata:
     homepage: https://castreader.ai/openclaw
 ---
 
-# CastReader — 和 AI 一起读书听书
+# CastReader — Read & Listen to Books with AI
 
 ## Setup (once per session)
 
@@ -21,106 +21,106 @@ metadata:
 cd <skill-directory> && npm install --silent 2>/dev/null
 ```
 
-## 平台与用户检测
+## Platform & User Detection
 
-用户消息前缀格式：`[<Platform> <username> id:<chatId> ...]`
+User message prefix format: `[<Platform> <username> id:<chatId> ...]`
 - Platform = Telegram / WhatsApp / iMessage
-- chatId = message tool 的 target
-- channel = platform 小写（telegram / whatsapp / imessage）
+- chatId = target for the message tool
+- channel = platform in lowercase (telegram / whatsapp / imessage)
 
-解析规则：
-1. 从前缀提取 platform（第一个词）和 id:后面的数字
+Parsing rules:
+1. Extract platform (first word) and chatId (number after `id:`)
 2. channel = platform.toLowerCase()
-3. 所有 message tool 调用使用解析出的 channel 和 target
+3. All message tool calls use the parsed channel and target
 
-示例：
+Examples:
 - `[Telegram xu id:123]` → channel="telegram", target="123"
 - `[WhatsApp John id:456]` → channel="whatsapp", target="456"
 
 ---
 
-## 核心流程：共读共听
+## Core Flow: Read Together
 
-### 入口判断
+### Entry Point
 
-1. 先检查本地书库 `~/castreader-library/index.json`
-   - 有已同步的书 → 展示本地书单，用户可直接选读
-   - 为空或不存在 → 引导同步
-2. 用户想读一本新书（本地没有）→ 引导同步那一本
+1. Check local library at `~/castreader-library/index.json`
+   - Has synced books → Show local book list, user can pick one to read
+   - Empty or missing → Guide user to sync
+2. User wants a book not in local library → Sync that specific book
 
-### 展示本地书单
+### Show Local Book List
 
 ```
 cat ~/castreader-library/index.json
 ```
 
-格式化为编号列表：
+Format as numbered list:
 ```
-📚 你的书架 (N 本)
+Your bookshelf (N books)
 
-1. 《海边的卡夫卡》 — 村上春树 · 58章
-2. 《绿山墙的安妮》 — 蒙哥马利 · 40章
+1. "Kafka on the Shore" — Haruki Murakami · 58 chapters
+2. "Anne of Green Gables" — L.M. Montgomery · 40 chapters
 ...
 
-选一本开始读吧！（想读新书？告诉我去 Kindle/微信读书同步）
+Pick one to start reading! (Want a new book? Tell me to sync from Kindle/WeRead)
 ```
 
-### 用户选书后 → 展示目录
+### After User Picks a Book → Show Table of Contents
 
 ```
 cat ~/castreader-library/books/<id>/meta.json
 ```
 
-列出章节目录：
+List chapter TOC:
 ```
-📖《海边的卡夫卡》目录：
+"Kafka on the Shore" — Table of Contents:
 
-1. 版权信息
-2. 中文版序言
-3. 译序
-4. 叫乌鸦的少年
-5. 第1章
+1. Copyright
+2. Preface
+3. Translator's Note
+4. The Boy Named Crow
+5. Chapter 1
 ...
 
-从哪章开始？（直接说章节号或章节名）
+Where to start? (Say a chapter number or name)
 ```
 
-### 用户选章后 → 共读
+### After User Picks a Chapter → Read Together
 
 ```
 cat ~/castreader-library/books/<id>/chapter-NN.md
 ```
 
-读取内容后：
-- 给出章节概览 / 讨论要点
-- 进入自由对话：讨论、提问、总结、联想其他章节
-- 用户可随时说"下一章"继续
+After reading the content:
+- Give chapter overview / discussion points
+- Enter free conversation: discuss, ask questions, summarize, connect to other chapters
+- User can say "next chapter" to continue
 
-### 朗读（用户说"念给我听"/"朗读"/"读给我听"时）
+### Read Aloud (when user says "read it aloud" / "listen" / "play")
 
-1. 将章节内容存为临时文件：
+1. Save chapter content to temp file:
 ```
 echo "<chapter text>" > /tmp/castreader-chapter.txt
 ```
 
-2. 生成音频：
+2. Generate audio:
 ```
 node scripts/generate-text.js /tmp/castreader-chapter.txt <language>
 ```
-language: 中文书用 `zh`，英文书用 `en`，根据内容自动判断。
+language: use `zh` for Chinese books, `en` for English books — detect automatically from content.
 
-3. 发送 MP3：
+3. Send MP3:
 ```json
-{"action":"send", "target":"<chatId>", "channel":"<channel>", "filePath":"/tmp/castreader-chapter.mp3", "caption":"🔊 《Book Title》 Chapter N"}
+{"action":"send", "target":"<chatId>", "channel":"<channel>", "filePath":"/tmp/castreader-chapter.mp3", "caption":"🔊 \"Book Title\" Chapter N"}
 ```
 
-### 同步书籍（书库为空 or 用户想读新书）
+### Sync Books (when library is empty or user wants a new book)
 
-当用户想读一本本地没有的书，或书库为空时触发。
+Triggered when user wants a book not in local library, or library is empty.
 
-先问用户："你用的是 Kindle 还是微信读书？"
+Ask user: "Do you use Kindle or WeRead?"
 
-**Three-phase flow: Login → 列出远端书单 → 同步选定的书**
+**Three-phase flow: Login → List remote shelf → Sync selected book**
 
 #### Phase 1: Login (check + interactive)
 
@@ -137,17 +137,17 @@ Output: JSON `{"event":"...", "step":"...", "screenshot":"...", "message":"...",
 - `event: "login_step"` → Login is needed. **Ask user to choose:**
 
 ```
-需要登录你的 Amazon/WeRead 账号，请选择登录方式：
+You need to log in to your Amazon/WeRead account. Choose a method:
 
-1️⃣ 我去电脑上登录（浏览器已打开，请在电脑上完成登录）
-2️⃣ 提供账号密码，帮我自动登录
+1️⃣ I'll log in on my computer (browser is open, complete login there)
+2️⃣ Provide credentials for automated login
 ```
 
 **STOP and wait for user reply.**
 
 ##### Option 1: User logs in manually on computer
 
-Tell user: "请在电脑上打开的浏览器中完成登录，登录完成后告诉我。"
+Tell user: "Please complete the login in the browser window on your computer. Let me know when done."
 
 Then poll login status every 15 seconds:
 ```
@@ -186,59 +186,59 @@ node scripts/sync-login.js kindle input "<user's reply text>"
 node scripts/sync-login.js kindle stop
 ```
 
-#### Phase 3: 同步书籍（三种场景）
+#### Phase 3: Sync Books (three scenarios)
 
-##### 场景 A：用户已经说了书名（如"帮我同步《海边的卡夫卡》"）
+##### Scenario A: User already named a book (e.g. "sync Kafka on the Shore")
 
-直接同步指定书，跳过 `--list`：
+Sync the specified book directly, skip `--list`:
 ```
-node scripts/sync-books.js kindle --book "海边的卡夫卡"
+node scripts/sync-books.js kindle --book "Kafka on the Shore"
 ```
 
-##### 场景 B：用户不确定读什么（如"看看我 Kindle 有什么书"）
+##### Scenario B: User is browsing (e.g. "what books do I have on Kindle?")
 
-先列出远端书架（不同步，只列表）：
+List remote shelf first (no sync, list only):
 ```
 node scripts/sync-books.js kindle --list
 ```
 Output: `{"books":[{"title":"...","author":"..."},...]}`
 
-展示给用户选择：
+Show to user:
 ```
-📚 你的 Kindle 书架 (N 本)
+Your Kindle library (N books)
 
-1. 《海边的卡夫卡》 — 村上春树
-2. 《Thinking, Fast and Slow》 — Daniel Kahneman
+1. "Kafka on the Shore" — Haruki Murakami
+2. "Thinking, Fast and Slow" — Daniel Kahneman
 ...
 
-想读哪本？
+Which one do you want to read?
 ```
 
 **STOP and wait for user to pick a book.** Then sync:
 ```
-node scripts/sync-books.js kindle --book "海边的卡夫卡"
+node scripts/sync-books.js kindle --book "Kafka on the Shore"
 ```
 
-##### 场景 C：用户明确要求同步全部（如"把我所有书都同步下来"）
+##### Scenario C: User explicitly requests full sync (e.g. "sync all my books")
 
 ```
 node scripts/sync-books.js kindle
 ```
-不带 `--book`，同步全部未同步的书。
+Without `--book`, syncs all unsynced books.
 
-#### 同步脚本输出
+#### Sync Script Output
 
 The script outputs JSON events on stdout:
-- `{"event":"wechat_qr","screenshot":"..."}` → Send QR screenshot to user: "📱 请在微信中长按识别此二维码登录微信读书，登录后会自动开始同步。"
+- `{"event":"wechat_qr","screenshot":"..."}` → Send QR screenshot to user: "Scan this QR code with WeChat to log in to WeRead. Sync will start automatically after login."
 - `{"event":"login_required"}` → Re-run Phase 1.
-- `{"event":"login_complete"}` → "登录成功！正在同步..."
+- `{"event":"login_complete"}` → "Login successful! Syncing..."
 - Final: `{"success":true,"booksSynced":N,"totalBooks":M,...}`
 
-Sync complete → 自动进入共读流程（展示目录，问从哪章开始）。
+Sync complete → Automatically enter read-together flow (show TOC, ask where to start).
 
 ---
 
-## URL 朗读（用户发 URL 时）
+## URL Read Aloud (when user sends a URL)
 
 ### Step 1: Extract
 
@@ -289,14 +289,14 @@ Send audio:
 
 ## Rules
 
-- 默认走共读流程，不要一上来就列功能菜单
-- 用户提到书名 / 章节 / "我想读书" → 直接进入共读
-- 用户发 URL → URL 朗读
-- **同步时只同步用户选的那一本书**（`--book "书名"`），不要默认同步整个书架
-- 只有用户明确说"同步所有书"/"全部同步"时，才不带 `--book` 参数
-- 朗读时自动检测语言（中文书用 zh，英文书用 en）
-- 每次读完一章，主动问"继续下一章？"
-- message tool 的 channel 必须从用户消息前缀动态检测，不硬编码 telegram
+- Default to read-together flow. Do NOT list a feature menu upfront.
+- User mentions a book title / chapter / "I want to read" → Enter read-together flow
+- User sends a URL → URL read-aloud flow
+- **Only sync the book the user selected** (`--book "title"`). Do NOT sync the entire library by default.
+- Only omit `--book` when user explicitly says "sync all books" / "sync everything"
+- Auto-detect language for TTS (zh for Chinese books, en for English books)
+- After finishing a chapter, proactively ask "Continue to the next chapter?"
+- The message tool's channel MUST be dynamically detected from the user message prefix. Never hardcode telegram.
 - ALWAYS send audio files using the `message` tool with `target` and `channel`. Never just print the file path.
 - Do NOT use built-in TTS tools. ONLY use `read-url.js` and `generate-text.js`.
 - Do NOT use web_fetch. ONLY use `read-url.js`.
