@@ -3,7 +3,7 @@ name: castreader
 description: >
   Read books together with AI. Pick a book from your Kindle or WeRead library,
   discuss chapter by chapter, and listen aloud.
-version: 3.0.1
+version: 3.1.0
 metadata:
   openclaw:
     emoji: "📖"
@@ -26,16 +26,42 @@ cd <skill-directory> && npm install --silent 2>/dev/null
 User message prefix format: `[<Platform> <username> id:<chatId> ...]`
 - Platform = Telegram / WhatsApp / iMessage
 - chatId = target for the message tool
-- channel = platform in lowercase (telegram / whatsapp / imessage)
-
-Parsing rules:
-1. Extract platform (first word) and chatId (number after `id:`)
-2. channel = platform.toLowerCase()
-3. All message tool calls use the parsed channel and target
+- channel = platform.toLowerCase()
 
 Examples:
 - `[Telegram xu id:123]` → channel="telegram", target="123"
 - `[WhatsApp John id:456]` → channel="whatsapp", target="456"
+
+---
+
+## CRITICAL UX RULES
+
+**Users are on their phone. They cannot see what's happening on the server. Every long operation MUST follow this pattern:**
+
+1. **BEFORE starting**: Tell the user WHAT you're about to do and HOW LONG it will take
+2. **DURING**: Send progress updates for anything longer than 30 seconds
+3. **AFTER**: Confirm completion and immediately show the next step
+
+**Time estimates to use:**
+- Listing books: "~30 seconds"
+- Syncing a short book (<20 chapters): "1-3 minutes"
+- Syncing a long book (>50 chapters): "5-10 minutes"
+- Generating audio for a chapter: "~1 minute"
+
+**Example of GOOD communication:**
+```
+I'll sync "A Journey to the Centre of the Earth" from your Kindle now.
+This usually takes 2-3 minutes. I'll update you on progress...
+
+📖 Syncing... 25% done
+📖 Syncing... 60% done
+📖 Done! 43 chapters synced. Here's the table of contents:
+```
+
+**Example of BAD communication (NEVER do this):**
+```
+[runs sync command silently for 5 minutes with no message to user]
+```
 
 ---
 
@@ -44,9 +70,9 @@ Examples:
 ### Entry Point
 
 1. Check local library at `~/castreader-library/index.json`
-   - Has synced books → Show local book list, user can pick one to read
-   - Empty or missing → Guide user to sync
-2. User wants a book not in local library → Sync that specific book
+   - Has synced books → Show book list, let user pick
+   - Empty or missing → Guide to sync
+2. User wants a new book not in library → Sync that one book
 
 ### Show Local Book List
 
@@ -54,16 +80,7 @@ Examples:
 cat ~/castreader-library/index.json
 ```
 
-Format as numbered list:
-```
-Your bookshelf (N books)
-
-1. "Kafka on the Shore" — Haruki Murakami · 58 chapters
-2. "Anne of Green Gables" — L.M. Montgomery · 40 chapters
-...
-
-Pick one to start reading! (Want a new book? Tell me to sync from Kindle/WeRead)
-```
+Format as numbered list, then ask which one to read.
 
 ### After User Picks a Book → Show Table of Contents
 
@@ -71,19 +88,7 @@ Pick one to start reading! (Want a new book? Tell me to sync from Kindle/WeRead)
 cat ~/castreader-library/books/<id>/meta.json
 ```
 
-List chapter TOC:
-```
-"Kafka on the Shore" — Table of Contents:
-
-1. Copyright
-2. Preface
-3. Translator's Note
-4. The Boy Named Crow
-5. Chapter 1
-...
-
-Where to start? (Say a chapter number or name)
-```
+List chapters, ask where to start.
 
 ### After User Picks a Chapter → Read Together
 
@@ -91,154 +96,110 @@ Where to start? (Say a chapter number or name)
 cat ~/castreader-library/books/<id>/chapter-NN.md
 ```
 
-After reading the content:
 - Give chapter overview / discussion points
-- Enter free conversation: discuss, ask questions, summarize, connect to other chapters
-- User can say "next chapter" to continue
+- Free conversation: discuss, questions, summary
+- User says "next chapter" → continue
 
-### Read Aloud (when user says "read it aloud" / "listen" / "play")
+### Read Aloud (user says "read it aloud" / "listen")
 
-1. Save chapter content to temp file:
+**Tell user first:** "Generating audio for this chapter, about 1 minute..."
+
+1. Save chapter to temp file
+2. Generate: `node scripts/generate-text.js /tmp/castreader-chapter.txt <language>`
+3. Send MP3 via message tool
+
+---
+
+## Sync Books (library empty or user wants new book)
+
+### Step 1: Ask platform
+
+Ask: "Do you use **Kindle** or **WeRead**?"
+
+### Step 2: Login
+
+**IMPORTANT: Do NOT use the automated credential flow (sync-login.js input). It is unreliable — browser popups block it.**
+
+**Always use manual login:**
+
+Tell user:
 ```
-echo "<chapter text>" > /tmp/castreader-chapter.txt
-```
+To access your Kindle/WeRead bookshelf, I need you to log in first.
 
-2. Generate audio:
-```
-node scripts/generate-text.js /tmp/castreader-chapter.txt <language>
-```
-language: use `zh` for Chinese books, `en` for English books — detect automatically from content.
+I'm opening a browser on your computer — please go to your computer and log in there.
+For Kindle: enter your Amazon email and password.
+For WeRead: scan the QR code with WeChat.
 
-3. Send MP3:
-```json
-{"action":"send", "target":"<chatId>", "channel":"<channel>", "filePath":"/tmp/castreader-chapter.mp3", "caption":"🔊 \"Book Title\" Chapter N"}
-```
+⚡ This is a ONE-TIME setup — once you log in, future syncs won't need login again.
 
-### Sync Books (when library is empty or user wants a new book)
-
-Triggered when user wants a book not in local library, or library is empty.
-
-Ask user: "Do you use Kindle or WeRead?"
-
-**Three-phase flow: Login → List remote shelf → Sync selected book**
-
-#### Phase 1: Login (check + interactive)
-
-```
-node scripts/sync-login.js kindle start
-```
-or `weread` instead of `kindle`.
-
-Output: JSON `{"event":"...", "step":"...", "screenshot":"...", "message":"...", "loggedIn":...}`
-
-**Handle each event:**
-
-- `event: "already_logged_in"` → Tell user "Already logged in!" and skip to Phase 2.
-- `event: "login_step"` → Login is needed. **Ask user to choose:**
-
-```
-You need to log in to your Amazon/WeRead account. Choose a method:
-
-1️⃣ I'll log in on my computer (browser is open, complete login there)
-2️⃣ Provide credentials for automated login
+Let me know when you're done!
 ```
 
-**STOP and wait for user reply.**
-
-##### Option 1: User logs in manually on computer
-
-Tell user: "Please complete the login in the browser window on your computer. Let me know when done."
-
-Then poll login status every 15 seconds:
+Then run:
 ```
-node scripts/sync-login.js kindle status
-```
-- If `loggedIn: true` → Tell user "Login successful!" and proceed to Phase 2.
-- If `loggedIn: false` after user says they logged in → Send screenshot to user, ask them to check.
-- Keep polling until `loggedIn: true` or user cancels.
-
-##### Option 2: Automated login via credentials
-
-Ask user for credentials step by step. Each step: enter text → screenshot → next step.
-
-```
-node scripts/sync-login.js kindle input "<user's reply text>"
+node scripts/sync-login.js <kindle|weread> start
 ```
 
-- If `event: "login_complete"` → Proceed to Phase 2.
-- If `event: "login_step"` with `step: "password"` → Ask for password.
-- If `event: "login_step"` with `step: "2fa"` → Ask for verification code.
-- If `event: "login_step"` with `step: "captcha"` → Send screenshot, ask user to type characters.
-- `step: "wechat_qr"` → Send screenshot, tell user to scan QR with WeChat. Poll every 10s:
-  ```
-  node scripts/sync-login.js weread status
-  ```
-  Until `loggedIn: true`.
+- If output has `"already_logged_in"` → Tell user "Already logged in!" and skip to Step 3
+- If output has `"login_step"` → Browser is open, user needs to go log in
+  - For WeRead: tell user "Scan the QR code with WeChat on your computer screen"
+  - For Kindle: tell user "Enter your Amazon credentials in the browser on your computer"
 
-**Send screenshots to user:**
-```json
-{"action":"send", "target":"<chatId>", "channel":"<channel>", "filePath":"<screenshot path>", "caption":"<message>"}
+Poll every 15 seconds:
+```
+node scripts/sync-login.js <kindle|weread> status
 ```
 
-#### Phase 2: Close login Chrome
-
+When `loggedIn: true` → Tell user "Login successful!" then:
 ```
-node scripts/sync-login.js kindle stop
-```
-
-#### Phase 3: Sync Books (three scenarios)
-
-##### Scenario A: User already named a book (e.g. "sync Kafka on the Shore")
-
-Sync the specified book directly, skip `--list`:
-```
-node scripts/sync-books.js kindle --book "Kafka on the Shore"
+node scripts/sync-login.js <kindle|weread> stop
 ```
 
-##### Scenario B: User is browsing (e.g. "what books do I have on Kindle?")
+### Step 3: List books
 
-List remote shelf first (no sync, list only):
+**Tell user first:** "Scanning your library, about 30 seconds..."
+
 ```
-node scripts/sync-books.js kindle --list
+node scripts/sync-books.js <kindle|weread> --list
 ```
+
 Output: `{"books":[{"title":"...","author":"..."},...]}`
 
-Show to user:
-```
-Your Kindle library (N books)
+Show numbered list to user, ask which one to read.
 
-1. "Kafka on the Shore" — Haruki Murakami
-2. "Thinking, Fast and Slow" — Daniel Kahneman
-...
+**STOP and wait for user to pick.**
 
-Which one do you want to read?
-```
+### Step 4: Sync the selected book
 
-**STOP and wait for user to pick a book.** Then sync:
-```
-node scripts/sync-books.js kindle --book "Kafka on the Shore"
-```
-
-##### Scenario C: User explicitly requests full sync (e.g. "sync all my books")
+**Tell user first:** "Syncing '[book title]' now. This takes about 2-5 minutes depending on the book length. I'll keep you updated on progress..."
 
 ```
-node scripts/sync-books.js kindle
+node scripts/sync-books.js <kindle|weread> --book "Book Title"
 ```
-Without `--book`, syncs all unsynced books.
 
-#### Sync Script Output
+**While sync is running:** The script outputs progress to stderr. Parse and send periodic updates to the user:
+- At 25%: "📖 Syncing... 25% done"
+- At 50%: "📖 Halfway there..."
+- At 75%: "📖 Almost done, 75%..."
+- When complete: "📖 Done! [N] chapters synced."
 
-The script outputs JSON events on stdout:
-- `{"event":"wechat_qr","screenshot":"..."}` → Send QR screenshot to user: "Scan this QR code with WeChat to log in to WeRead. Sync will start automatically after login."
-- `{"event":"login_required"}` → Re-run Phase 1.
-- `{"event":"login_complete"}` → "Login successful! Syncing..."
-- Final: `{"success":true,"booksSynced":N,"totalBooks":M,...}`
+**If sync fails or gets interrupted:** Tell user "The sync got interrupted at X%. Let me retry..." and run the same command again. The script will resume from where it left off (already-synced chapters are skipped).
 
-Sync complete → Automatically enter read-together flow (show TOC, ask where to start).
+After sync complete → Show table of contents, ask where to start reading.
+
+### Sync Script Output
+
+JSON events on stdout:
+- `{"books":[...]}` → Book list from --list
+- `{"success":true,"booksSynced":N,...}` → Sync complete
+- `{"event":"wechat_qr","screenshot":"..."}` → WeRead QR login needed
+- `{"event":"login_required"}` → Need login, go back to Step 2
 
 ---
 
 ## URL Read Aloud (when user sends a URL)
+
+**Tell user:** "Extracting article content, just a moment..."
 
 ### Step 1: Extract
 
@@ -246,15 +207,11 @@ Sync complete → Automatically enter read-together flow (show TOC, ask where to
 node scripts/read-url.js "<url>" 0
 ```
 
-Returns: `{ title, language, totalParagraphs, totalCharacters, paragraphs[] }`
-
 ### Step 2: Show info + ask
 
 ```
 📖 {title}
-🌐 {language} · 📝 {totalParagraphs} paragraphs · 📊 {totalCharacters} chars
-
-📋 Summary: {2-3 sentence summary}
+{totalParagraphs} paragraphs · {totalCharacters} chars
 
 1️⃣ Listen to full article
 2️⃣ Listen to summary only
@@ -262,41 +219,28 @@ Returns: `{ title, language, totalParagraphs, totalCharacters, paragraphs[] }`
 
 **STOP. Wait for user reply.**
 
-### Step 3a: Full article (user chose 1)
+### Step 3: Generate and send
 
-```
-node scripts/read-url.js "<url>" all
-```
+**Tell user:** "Generating audio, about 1 minute..."
 
-Send audio:
-```json
-{"action":"send", "target":"<chatId>", "channel":"<channel>", "filePath":"<audioFile>", "caption":"🔊 {title}"}
-```
+For full article: `node scripts/read-url.js "<url>" all`
+For summary: write summary to file, then `node scripts/generate-text.js`
 
-### Step 3b: Summary only (user chose 2)
-
-```
-echo "<summary>" > /tmp/castreader-summary.txt
-node scripts/generate-text.js /tmp/castreader-summary.txt <language>
-```
-
-Send audio:
-```json
-{"action":"send", "target":"<chatId>", "channel":"<channel>", "filePath":"/tmp/castreader-summary.mp3", "caption":"📋 Summary: {title}"}
-```
+Send via message tool.
 
 ---
 
 ## Rules
 
 - Default to read-together flow. Do NOT list a feature menu upfront.
-- User mentions a book title / chapter / "I want to read" → Enter read-together flow
-- User sends a URL → URL read-aloud flow
-- **Only sync the book the user selected** (`--book "title"`). Do NOT sync the entire library by default.
-- Only omit `--book` when user explicitly says "sync all books" / "sync everything"
-- Auto-detect language for TTS (zh for Chinese books, en for English books)
-- After finishing a chapter, proactively ask "Continue to the next chapter?"
-- The message tool's channel MUST be dynamically detected from the user message prefix. Never hardcode telegram.
-- ALWAYS send audio files using the `message` tool with `target` and `channel`. Never just print the file path.
+- **ALWAYS tell user what you're doing and how long before running any command**
+- **Login: ONLY manual login on computer. Do NOT send screenshots or ask for passwords via chat.**
+- **If sync fails or interrupts, automatically retry once before asking user**
+- Only sync the book the user selected (`--book "title"`). Do NOT sync entire library by default.
+- Only omit `--book` when user explicitly says "sync all"
+- Auto-detect language for TTS (zh for Chinese, en for English)
+- After finishing a chapter, ask "Continue to the next chapter?"
+- Channel MUST be dynamically detected from user message prefix. Never hardcode.
+- ALWAYS send audio via message tool. Never just print file path.
 - Do NOT use built-in TTS tools. ONLY use `read-url.js` and `generate-text.js`.
 - Do NOT use web_fetch. ONLY use `read-url.js`.
