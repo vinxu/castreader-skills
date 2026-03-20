@@ -1,0 +1,5 @@
+node_modules/
+.chrome-profile/
+*.zip
+.output/
+.output-bak/
