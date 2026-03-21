@@ -128,98 +128,54 @@ cat ~/castreader-library/books/<id>/chapter-NN.md
 
 Ask: "Do you use **Kindle** or **WeRead**?"
 
-### Step 2: Login + List books (ALWAYS do login check first)
+### Step 2: List books
 
-**IMPORTANT: ALWAYS run login first, even if user previously logged in. The login session may have expired or been cleared.**
+**IMPORTANT: Do NOT use sync-login.js. Do NOT take screenshots. Do NOT poll login status.**
 
-**IMPORTANT: Do NOT use the automated credential flow (sync-login.js input). It is unreliable — browser popups block it.**
+The `sync-books.js --list` script handles EVERYTHING automatically:
+- Opens browser with saved login session
+- If already logged in → lists books immediately
+- If not logged in → opens login page, waits for user to log in, then lists books
 
-**Always use manual login:**
+Just tell the user and run:
 
-Tell user WHY login is needed (adapt based on platform):
-
-For Kindle:
-```
-Your Kindle books are protected by Amazon's DRM — I can't access them directly.
-I need you to log in to your Amazon account so I can read your bookshelf.
-
-I'm opening a browser on your computer now. Please go to your computer and sign in with your Amazon account.
-
-⚡ You only need to do this ONCE. After this login, I can sync any book from your Kindle library anytime without asking again.
-
-Let me know when you've signed in!
-```
-
-For WeRead:
-```
-Your WeRead books require WeChat authentication — I need you to scan a QR code to connect.
-
-I'm opening a browser on your computer now. Please go to your computer and scan the QR code on screen with WeChat.
-
-⚡ You only need to do this ONCE. After this login, I can sync any book from your WeRead library anytime without asking again.
-
-Let me know when you've scanned the code!
-```
-
-Then run:
-```
-node scripts/sync-login.js <kindle|weread> start
-```
-
-- If output has `"already_logged_in"` → Tell user "Great, you're already logged in!" and continue to list books
-- If output has `"login_step"` → Browser is open, user needs to go log in
-  - For WeRead: tell user "Scan the QR code with WeChat on your computer screen"
-  - For Kindle: tell user "Enter your Amazon credentials in the browser on your computer"
-
-Poll every 15 seconds:
-```
-node scripts/sync-login.js <kindle|weread> status
-```
-
-When `loggedIn: true` → Tell user "Login successful!" then:
-```
-node scripts/sync-login.js <kindle|weread> stop
-```
-
-**After login confirmed**, list books:
-
-**Tell user:** "Scanning your library, about 30 seconds..."
+**Tell user:** "正在扫描你的书架，大约 30 秒..."
 
 ```
 node scripts/sync-books.js <kindle|weread> --list
 ```
 
-Output: `{"books":[{"title":"...","author":"..."},...]}`
+**Handle output (stdout may contain multiple JSON lines — process each):**
 
-Show numbered list to user, ask which one to read.
+- `{"books":[...]}` → Show numbered list, ask which one to read
+- `{"event":"login_complete"}` → Login was automatic or cookie-restored, no user action needed
+- `{"event":"wechat_qr","screenshot":"/path/to/qr.png"}` → **Send the QR image to user via message tool**, then tell user: "请用微信扫描这个二维码登录微信读书，登录后会自动开始同步"
+- `{"event":"login_required","source":"kindle"}` → **Ask user**: "需要登录 Kindle，你可以选择：\n1. 自己去电脑浏览器上登录\n2. 把亚马逊邮箱和密码发给我，我帮你自动登录"
+  - If user provides email and password → Kill the current script, re-run with credentials:
+    `node scripts/sync-books.js kindle --list --email "user@email.com" --password "password123"`
+  - If user says they'll log in themselves → Wait for the current script to detect login completion
+- `{"event":"kindle_2fa_required","screenshot":"/path/to/screenshot.png"}` → **Send the screenshot to user via message tool**, then tell user: "亚马逊需要验证码，请查看手机短信或邮箱，把验证码发给我"
+- `{"event":"kindle_login_error","message":"..."}` → Tell user the error message, ask them to retry
+- stderr "Already logged in" → Login was automatic, no user action needed
+- Script exits with error → Tell user and retry
 
-**STOP and wait for user to pick.**
+**IMPORTANT for WeRead QR:** The script outputs a JSON line with `event: "wechat_qr"` and `screenshot` path. You MUST read that image file and send it to the user via the message tool so they can scan it on their phone. Do NOT just tell them to look at the computer screen.
+
+**IMPORTANT for Kindle credentials:** When user provides email/password, pass them via `--email` and `--password` flags. The script will auto-fill the Amazon login form. If 2FA is required, send the screenshot to the user and wait for them to provide the code. **NEVER store or log the user's password.**
+
+**STOP and wait for user to pick a book.**
 
 ### Step 3: Sync the selected book
 
-**Tell user first:** "Syncing '[book title]' now. This takes about 2-5 minutes depending on the book length. I'll keep you updated on progress..."
+**Tell user first:** "正在同步《书名》，大约需要 1-2 分钟..."
 
 ```
 node scripts/sync-books.js <kindle|weread> --book "Book Title"
 ```
 
-**While sync is running:** The script outputs progress to stderr. Parse and send periodic updates to the user:
-- At 25%: "📖 Syncing... 25% done"
-- At 50%: "📖 Halfway there..."
-- At 75%: "📖 Almost done, 75%..."
-- When complete: "📖 Done! [N] chapters synced."
-
-**If sync fails or gets interrupted:** Tell user "The sync got interrupted at X%. Let me retry..." and run the same command again. The script will resume from where it left off (already-synced chapters are skipped).
-
 After sync complete → Show table of contents, ask where to start reading.
 
-### Sync Script Output
-
-JSON events on stdout:
-- `{"books":[...]}` → Book list from --list
-- `{"success":true,"booksSynced":N,...}` → Sync complete
-- `{"event":"wechat_qr","screenshot":"..."}` → WeRead QR login needed
-- `{"event":"login_required"}` → Need login, go back to Step 2
+**If sync fails:** Tell user and retry the same command once. Already-synced chapters are skipped.
 
 ---
 
