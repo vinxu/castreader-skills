@@ -13,6 +13,7 @@
     "read-aloud": "node scripts/read-aloud.js"
   },
   "dependencies": {
+    "@cherrystudio/mac-system-ocr": "^0.2.7",
     "puppeteer": "^23.0.0"
   }
 }
