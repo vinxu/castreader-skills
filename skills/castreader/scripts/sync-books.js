@@ -927,6 +927,36 @@ async function waitForWeReadQrCode(page, timeoutMs = 15000) {
 async function kindleAutoLogin(page, email, password) {
   process.stderr.write('  Auto-filling Kindle login...\n');
 
+  // Step 0: If on landing page (not the login form), navigate to login
+  const currentUrl = page.url();
+  if (currentUrl.includes('read.amazon.com/landing')) {
+    process.stderr.write('  On landing page, navigating to sign-in...\n');
+    // Find the sign-in link by clicking it or navigate directly
+    try {
+      const clicked = await page.evaluate(() => {
+        // Find any link/button containing "Sign in" text
+        const els = document.querySelectorAll('a, button');
+        for (const el of els) {
+          if (el.textContent?.includes('Sign in')) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (!clicked) {
+        // Direct navigation to Amazon sign-in with return to Kindle
+        await page.goto('https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fread.amazon.com%2Fkindle-library&openid.assoc_handle=amzn_kweb&openid.mode=checkid_setup&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0', { waitUntil: 'networkidle2', timeout: 30000 });
+      }
+      await sleep(3000);
+    } catch (e) {
+      process.stderr.write(`  Landing page nav failed: ${e.message}\n`);
+      // Last resort: direct sign-in URL
+      await page.goto('https://www.amazon.com/ap/signin?openid.return_to=https%3A%2F%2Fread.amazon.com%2Fkindle-library', { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+      await sleep(3000);
+    }
+  }
+
   // Step 1: Email
   try {
     await page.waitForSelector('#ap_email', { timeout: 10000 });
@@ -1614,6 +1644,156 @@ async function clickWeReadBook(page, bookId, bookTitle) {
 // ---- WeRead: extract text from fillText layout data ----
 
 /**
+ * Read preRenderContainer content directly from DOM.
+ * Filters out encrypted containers (24-space CSS indent).
+ * Returns paragraphs from the currently visible preRenderContainer(s).
+ */
+async function readPreRenderContent(page) {
+  return page.evaluate(() => {
+    const containers = document.querySelectorAll('.preRenderContainer');
+    const allParagraphs = [];
+
+    for (const container of containers) {
+      // Filter encrypted containers: 24-space indent = encrypted
+      const styleEl = container.querySelector('style');
+      if (styleEl) {
+        const styleText = styleEl.textContent || '';
+        if (styleText.includes('\n                        .readerChapterContent')) {
+          continue; // Skip encrypted
+        }
+      }
+
+      const content = container.querySelector('#preRenderContent') || container;
+      const clone = content.cloneNode(true);
+      clone.querySelectorAll('style, script, noscript').forEach(s => s.remove());
+      clone.querySelectorAll('.reader_footer_note, .js_readerFooterNote, [data-wr-footernote]').forEach(s => s.remove());
+
+      const blocks = clone.querySelectorAll('p, h1, h2, h3, h4, h5, h6');
+      const paragraphs = [];
+      for (const block of blocks) {
+        const text = block.textContent?.trim();
+        if (text && text.length >= 2) paragraphs.push(text);
+      }
+
+      // Fallback: textContent split by newlines
+      if (paragraphs.length === 0) {
+        const text = clone.textContent?.trim();
+        if (text && text.length > 10) {
+          paragraphs.push(...text.split(/\n+/).map(l => l.trim()).filter(l => l.length > 2));
+        }
+      }
+
+      if (paragraphs.length > 0) allParagraphs.push(...paragraphs);
+    }
+
+    return allParagraphs;
+  });
+}
+
+/**
+ * Set up a MutationObserver to capture ephemeral preRenderContainer content.
+ *
+ * WeRead scroll mode creates preRenderContainers with full chapter HTML,
+ * renders them to Canvas, then immediately removes them from the DOM.
+ * The MutationObserver catches the content during that brief window.
+ *
+ * Must be called BEFORE navigating to a chapter.
+ */
+async function setupPreRenderCapture(page) {
+  await page.evaluate(() => {
+    // Reset captured content
+    window.__wrCapturedChapters = [];
+    window.__wrCaptureActive = true;
+
+    // Only set up observer once
+    if (window.__wrObserver) return;
+
+    window.__wrObserverStats = { total: 0, encrypted: 0, real: 0 };
+    window.__wrObserver = new MutationObserver((mutations) => {
+      if (!window.__wrCaptureActive) return;
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (!(node instanceof HTMLElement)) continue;
+
+          // Check if this node IS a preRenderContainer or CONTAINS one
+          const containers = [];
+          if (node.classList?.contains('preRenderContainer')) {
+            containers.push(node);
+          }
+          if (node.querySelectorAll) {
+            containers.push(...node.querySelectorAll('.preRenderContainer'));
+          }
+
+          for (const container of containers) {
+            window.__wrObserverStats.total++;
+
+            // Filter encrypted containers (24-space CSS indent)
+            const styleEl = container.querySelector('style');
+            if (styleEl) {
+              const styleText = styleEl.textContent || '';
+              if (styleText.includes('\n                        .readerChapterContent')) {
+                window.__wrObserverStats.encrypted++;
+                continue; // Encrypted, skip
+              }
+            }
+
+            window.__wrObserverStats.real++;
+
+            // Extract text from the real container
+            const content = container.querySelector('#preRenderContent') || container;
+            const clone = content.cloneNode(true);
+            clone.querySelectorAll('style, script, noscript').forEach(s => s.remove());
+            clone.querySelectorAll('.reader_footer_note, .js_readerFooterNote, [data-wr-footernote]').forEach(s => s.remove());
+
+            const blocks = clone.querySelectorAll('p, h1, h2, h3, h4, h5, h6');
+            const paragraphs = [];
+            for (const block of blocks) {
+              const text = block.textContent?.trim();
+              if (text && text.length >= 2) paragraphs.push(text);
+            }
+
+            // Fallback: textContent split
+            if (paragraphs.length === 0) {
+              const text = clone.textContent?.trim();
+              if (text && text.length > 10) {
+                paragraphs.push(...text.split(/\n+/).map(l => l.trim()).filter(l => l.length > 2));
+              }
+            }
+
+            if (paragraphs.length > 0) {
+              window.__wrCapturedChapters.push(paragraphs);
+            }
+          }
+        }
+      }
+    });
+    window.__wrObserver.observe(document.body, { childList: true, subtree: true });
+  });
+}
+
+/**
+ * Read captured preRenderContainer content (does NOT clear the buffer).
+ * Returns all paragraphs captured since the last reset.
+ */
+async function readCapturedContent(page) {
+  return page.evaluate(() => {
+    const captured = window.__wrCapturedChapters || [];
+    // Flatten all captured chunks into one array, dedup
+    const seen = new Set();
+    const result = [];
+    for (const chunk of captured) {
+      for (const para of chunk) {
+        if (!seen.has(para)) {
+          seen.add(para);
+          result.push(para);
+        }
+      }
+    }
+    return result;
+  });
+}
+
+/**
  * Read layout data from intercept's DOM attribute.
  * Returns array of text lines from all Canvas pages.
  */
@@ -1638,6 +1818,11 @@ async function readWeReadLayoutText(page) {
 /**
  * Read chapter API data from intercept's DOM attribute.
  * Returns extracted paragraphs from the API response.
+ *
+ * Handles multiple formats:
+ * 1. JSON with HTML content fields
+ * 2. Raw hex+base64 encoded HTML (WeRead chapter API format)
+ * 3. Direct HTML
  */
 async function readWeReadChapterData(page) {
   return page.evaluate(() => {
@@ -1645,36 +1830,100 @@ async function readWeReadChapterData(page) {
     if (!raw) return [];
     const colonIdx = raw.indexOf(':');
     if (colonIdx <= 0) return [];
-    try {
-      const jsonStr = raw.substring(colonIdx + 1);
-      const firstChar = jsonStr.charAt(0);
-      if (firstChar !== '{' && firstChar !== '[') return []; // encrypted
-      const data = JSON.parse(jsonStr);
-      // Extract from HTML content fields
-      const htmlFields = [
-        data.chapterContentHtml, data.chapterContent, data.content,
-        data.htmlContent, data.html,
-        data.data?.chapterContentHtml, data.data?.chapterContent,
-      ];
-      for (const html of htmlFields) {
-        if (html && typeof html === 'string' && html.length > 50) {
-          const parser = new DOMParser();
-          const doc = parser.parseFromString(html, 'text/html');
-          const blocks = doc.querySelectorAll('p, h1, h2, h3, h4, h5, h6, li, blockquote');
-          const paragraphs = [];
-          for (const block of blocks) {
-            const text = block.textContent?.trim();
-            if (text && text.length >= 2) paragraphs.push(text);
-          }
-          if (paragraphs.length > 0) return paragraphs;
-          // Fallback: strip tags
-          const stripped = html.replace(/<[^>]+>/g, '\n').split(/\n+/)
-            .map(s => s.trim()).filter(s => s.length >= 5);
-          if (stripped.length > 0) return stripped;
-        }
+    const payload = raw.substring(colonIdx + 1);
+    if (payload.length < 50) return [];
+
+    /** Parse HTML string into paragraphs */
+    function htmlToParagraphs(html) {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, 'text/html');
+      // Remove footnotes and scripts
+      doc.querySelectorAll('style, script, noscript, .reader_footer_note, .js_readerFooterNote, [data-wr-footernote]').forEach(s => s.remove());
+      const blocks = doc.querySelectorAll('p, h1, h2, h3, h4, h5, h6, li, blockquote');
+      const paragraphs = [];
+      for (const block of blocks) {
+        const text = block.textContent?.trim();
+        if (text && text.length >= 2) paragraphs.push(text);
       }
-      return [];
-    } catch { return []; }
+      if (paragraphs.length > 0) return paragraphs;
+      // Fallback: strip tags
+      const stripped = html.replace(/<[^>]+>/g, '\n').split(/\n+/)
+        .map(s => s.trim()).filter(s => s.length >= 5);
+      return stripped;
+    }
+
+    // === Try 1: JSON format ===
+    const firstChar = payload.charAt(0);
+    if (firstChar === '{' || firstChar === '[') {
+      try {
+        const data = JSON.parse(payload);
+        const htmlFields = [
+          data.chapterContentHtml, data.chapterContent, data.content,
+          data.htmlContent, data.html,
+          data.data?.chapterContentHtml, data.data?.chapterContent,
+        ];
+        for (const html of htmlFields) {
+          if (html && typeof html === 'string' && html.length > 50) {
+            const paras = htmlToParagraphs(html);
+            if (paras.length > 0) return paras;
+          }
+        }
+      } catch {}
+    }
+
+    // === Try 2: hex(32) + base64 format (WeRead chapter API) ===
+    const hexPrefix = payload.substring(0, 32);
+    if (/^[0-9A-Fa-f]{32}$/.test(hexPrefix)) {
+      let b64 = payload.substring(32);
+      // Clean whitespace and normalize URL-safe base64
+      b64 = b64.replace(/[\s\r\n]+/g, '');
+      b64 = b64.replace(/-/g, '+').replace(/_/g, '/');
+      // Fix padding: mod 4 must be 0
+      const mod = b64.length % 4;
+      if (mod === 1) b64 = b64.substring(0, b64.length - 1); // trim extra char
+      else if (mod === 2) b64 += '==';
+      else if (mod === 3) b64 += '=';
+
+      try {
+        const decoded = atob(b64);
+        const bytes = new Uint8Array(decoded.length);
+        for (let i = 0; i < decoded.length; i++) {
+          bytes[i] = decoded.charCodeAt(i);
+        }
+        const text = new TextDecoder('utf-8').decode(bytes);
+
+        // Check if readable (not encrypted binary)
+        const sample = text.substring(0, 200);
+        const replacements = (sample.match(/\uFFFD/g) || []).length;
+        if (replacements / sample.length > 0.1) {
+          console.log('[sync] Chapter data encrypted, skipping');
+          return [];
+        }
+
+        // Try parsing as HTML
+        if (text.includes('<p') || text.includes('<h') || text.includes('<div')) {
+          const paras = htmlToParagraphs(text);
+          if (paras.length > 0) {
+            console.log('[sync] Decoded hex+b64 chapter:', paras.length, 'paras,', paras.join('').length, 'chars');
+            return paras;
+          }
+        }
+
+        // Not HTML — try plain text split
+        const lines = text.split(/\n+/).map(s => s.trim()).filter(s => s.length >= 5);
+        if (lines.length > 0) return lines;
+      } catch (e) {
+        console.log('[sync] Base64 decode failed:', e.message);
+      }
+    }
+
+    // === Try 3: Direct HTML ===
+    if (firstChar === '<') {
+      const paras = htmlToParagraphs(payload);
+      if (paras.length > 0) return paras;
+    }
+
+    return [];
   });
 }
 
@@ -1835,6 +2084,167 @@ function mergeLinesToParagraphs(lines) {
   return paragraphs;
 }
 
+// ---- WeRead: Search books ----
+
+// Parse search results from a page that's already on the search URL
+async function searchWeReadFromCurrentPage(page, keyword) {
+  process.stderr.write(`Parsing search results for "${keyword}"...\n`);
+  // Wait for book list to render
+  await page.waitForSelector('li.wr_bookList_item', { timeout: 10000 }).catch(() => {});
+  return _extractSearchResults(page, keyword);
+}
+
+async function searchWeRead(page, keyword) {
+  const searchUrl = `https://weread.qq.com/web/search/books?keyword=${encodeURIComponent(keyword)}`;
+  process.stderr.write(`Searching WeRead for "${keyword}"...\n`);
+  await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+
+  // Wait for book list to render (client-side rendered, not in __INITIAL_STATE__)
+  await page.waitForSelector('li.wr_bookList_item', { timeout: 10000 }).catch(() => {});
+
+  return _extractSearchResults(page, keyword);
+}
+
+async function _extractSearchResults(page, keyword) {
+  const results = await page.evaluate(() => {
+    const books = [];
+    const items = document.querySelectorAll('li.wr_bookList_item');
+    items.forEach(item => {
+      const titleEl = item.querySelector('p.wr_bookList_item_title');
+      const authorEl = item.querySelector('p.wr_bookList_item_author');
+      const linkEl = item.querySelector('a.wr_bookList_item_link');
+      const descEl = item.querySelector('p.wr_bookList_item_desc');
+      const ratingEl = item.querySelector('span.wr_bookList_item_reading_percent');
+      const readCountEl = item.querySelector('span.wr_bookList_item_reading_number');
+      const coverEl = item.querySelector('img.wr_bookCover_img');
+
+      const title = titleEl?.textContent?.trim() || '';
+      if (!title) return;
+
+      const href = linkEl?.getAttribute('href') || '';
+      const readerBookId = href.match(/\/web\/reader\/([^/?]+)/)?.[1] || '';
+
+      books.push({
+        title,
+        author: authorEl?.textContent?.trim() || '',
+        readerBookId,
+        readerUrl: readerBookId ? `https://weread.qq.com/web/reader/${readerBookId}` : '',
+        cover: coverEl?.src || '',
+        intro: (descEl?.textContent?.trim() || '').substring(0, 200),
+        rating: ratingEl?.textContent?.trim() || '',
+        readCount: readCountEl?.textContent?.trim() || '',
+      });
+    });
+    return books;
+  });
+
+  // Also grab total count from header
+  const totalCount = await page.evaluate(() => {
+    const header = document.querySelector('p.search_bookDetail_header_detail');
+    return header?.textContent?.trim() || '';
+  });
+
+  const top = results.slice(0, 10);
+  process.stderr.write(`Found ${results.length} results (${totalCount}), returning top ${top.length}.\n`);
+  console.log(JSON.stringify({ event: 'search_results', keyword, totalCount, books: top }));
+  return { searched: true, keyword, resultCount: top.length };
+}
+
+// ---- WeRead: Add book to shelf ----
+
+async function addToWeReadShelf(page, readerBookId) {
+  const readerUrl = `https://weread.qq.com/web/reader/${readerBookId}`;
+  // Only navigate if not already on the book page
+  if (!page.url().includes(readerBookId)) {
+    process.stderr.write(`Opening book page: ${readerUrl}...\n`);
+    await page.goto(readerUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+  }
+  // Wait for reader UI to render (replaced sleep(5000) with targeted wait)
+  await page.waitForSelector('button.readerTopBar_addToShelf, svg.readerTopBar_addToShelf_icon', { timeout: 10000 }).catch(() => {});
+
+  // Get book info from __INITIAL_STATE__ and check shelf status via CSS class + button text
+  const bookInfo = await page.evaluate(() => {
+    const state = window.__INITIAL_STATE__;
+    const reader = state?.reader || {};
+    const info = reader.bookInfo || {};
+    // Shelf status: the top-bar icon has class "added" when book is on shelf,
+    // or the button text is NOT "加入书架" (already shelved books show no text or different text)
+    const addedIcon = document.querySelector('svg.readerTopBar_addToShelf_icon.added');
+    const addBtn = document.querySelector('button.readerTopBar_addToShelf');
+    const btnText = addBtn?.textContent?.trim() || '';
+    const isInShelf = !!addedIcon || (addBtn && !btnText.includes('加入书架'));
+    return {
+      title: info.title || document.title || '',
+      bookId: reader.bookId || info.bookId || '',
+      isInShelf,
+    };
+  });
+
+  process.stderr.write(`  Book: "${bookInfo.title}", isInShelf: ${bookInfo.isInShelf}\n`);
+
+  if (bookInfo.isInShelf) {
+    console.log(JSON.stringify({
+      event: 'added_to_shelf',
+      title: bookInfo.title,
+      bookId: bookInfo.bookId,
+      readerBookId,
+      alreadyOnShelf: true,
+    }));
+    return { added: true, alreadyOnShelf: true, title: bookInfo.title };
+  }
+
+  // Click the add-to-shelf button in the top bar (Puppeteer real click for isTrusted)
+  let clicked = false;
+  const addShelfBtn = await page.$('button.readerTopBar_addToShelf');
+  if (addShelfBtn) {
+    await addShelfBtn.click();
+    clicked = true;
+    process.stderr.write('  Clicked top-bar "加入书架" button.\n');
+  }
+
+  // Fallback: try the outline panel button
+  if (!clicked) {
+    const outlineBtn = await page.$('div.wr_outline_book_detail_main_nav_action');
+    if (outlineBtn) {
+      const btnText = await outlineBtn.evaluate(el => el.textContent?.trim() || '');
+      if (btnText.includes('加入书架')) {
+        await outlineBtn.click();
+        clicked = true;
+        process.stderr.write('  Clicked outline panel "加入书架" button.\n');
+      }
+    }
+  }
+
+  if (!clicked) {
+    process.stderr.write('  Could not find add-to-shelf button.\n');
+  }
+
+  await sleep(3000);
+
+  // Verify: check if the icon now has the "added" class or button text changed
+  const afterStatus = await page.evaluate(() => {
+    const addedIcon = document.querySelector('svg.readerTopBar_addToShelf_icon.added');
+    if (addedIcon) return true;
+    // Also check if button text no longer says "加入书架"
+    const addBtn = document.querySelector('button.readerTopBar_addToShelf');
+    const btnText = addBtn?.textContent?.trim() || '';
+    return addBtn && !btnText.includes('加入书架');
+  });
+
+  process.stderr.write(`  After click: isInShelf = ${afterStatus}\n`);
+
+  console.log(JSON.stringify({
+    event: 'added_to_shelf',
+    title: bookInfo.title,
+    bookId: bookInfo.bookId,
+    readerBookId,
+    alreadyOnShelf: false,
+    success: afterStatus,
+  }));
+
+  return { added: afterStatus, alreadyOnShelf: false, title: bookInfo.title };
+}
+
 // ---- Main: WeRead flow (Puppeteer-driven navigation) ----
 
 async function syncWeRead(browser, extId, page, maxBooks, { listOnly = false, bookFilter = null } = {}) {
@@ -1925,31 +2335,20 @@ async function syncWeRead(browser, extId, page, maxBooks, { listOnly = false, bo
     await page.bringToFront();
     await sleep(2000);
 
-    // Detect pagination (double-column) mode and switch to scroll (single-column) mode
-    // Pagination mode has pager buttons ("上一页"/"下一页") or the isHorizontalReader control is active
+    // Switch to scroll (single-column) mode for reliable content extraction.
+    // In scroll mode, preRenderContainers have actual HTML text in DOM.
+    // In pagination mode, content is Canvas-only (DOM cleared after render).
     const isPagination = await page.evaluate(() => {
       return !!(document.querySelector('.renderTarget_pager_button') ||
                 document.querySelector('.readerControls_item.isHorizontalReader'));
     });
     if (isPagination) {
-      process.stderr.write(`  Detected pagination mode, switching to scroll mode...\n`);
-      // Click the isHorizontalReader toggle button directly — it switches between pagination/scroll
-      // Must use Puppeteer real click (isTrusted: true), WeRead React ignores element.click()
+      process.stderr.write(`  Switching to scroll mode...\n`);
       const toggleBtn = await page.$('.readerControls_item.isHorizontalReader');
       if (toggleBtn) {
-        await toggleBtn.click(); // Puppeteer real click
-        await sleep(3000); // Wait for page to re-render in scroll mode
+        await toggleBtn.click();
+        await sleep(3000);
         process.stderr.write(`  Switched to scroll mode.\n`);
-      } else {
-        process.stderr.write(`  Warning: Could not find layout toggle button.\n`);
-      }
-
-      // Verify we're now in scroll mode (pager buttons should be gone)
-      const stillPagination = await page.evaluate(() => {
-        return !!document.querySelector('.renderTarget_pager_button');
-      });
-      if (stillPagination) {
-        process.stderr.write(`  Warning: Still in pagination mode. Sync may not work correctly.\n`);
       }
     }
 
@@ -2003,9 +2402,11 @@ async function syncWeRead(browser, extId, page, maxBooks, { listOnly = false, bo
     process.stderr.write(`  Book: "${bookMeta.title}" by ${bookMeta.author} (${bookMeta.bookId})\n`);
     process.stderr.write(`  Found ${tocEntries.length} chapters in TOC.\n`);
 
-    // Sync each chapter: Puppeteer clicks TOC entry → wait for content → extract
+    // Install MutationObserver to capture preRenderContainer content
+    await setupPreRenderCapture(page);
+
+    // Sync each chapter: click TOC → scroll through → MutationObserver captures all preRenderContainers
     const chapters = [];
-    let prevFirstLine = '';
 
     for (let ch = 0; ch < tocEntries.length; ch++) {
       const chapterTitle = tocEntries[ch];
@@ -2017,6 +2418,9 @@ async function syncWeRead(browser, extId, page, maxBooks, { listOnly = false, bo
         await sleep(300);
       }
 
+      // Reset capture buffer before navigating
+      await page.evaluate(() => { window.__wrCapturedChapters = []; });
+
       // Click the TOC entry with Puppeteer (isTrusted: true)
       const clicked = await clickWeReadTocEntry(page, tocSelector, ch);
       if (!clicked) {
@@ -2024,27 +2428,58 @@ async function syncWeRead(browser, extId, page, maxBooks, { listOnly = false, bo
         continue;
       }
 
-      // Wait for content to change
-      await sleep(1500);
-      const layout = await waitForLayoutChange(page, prevFirstLine, 8000);
+      // Close TOC panel so it doesn't block content rendering
+      await sleep(500);
+      await page.keyboard.press('Escape');
 
-      if (layout.lines.length > 0) {
-        prevFirstLine = layout.lines[0];
-        const paragraphs = mergeLinesToParagraphs(layout.lines);
+      // Wait for initial preRenderContainer capture
+      const pollStart = Date.now();
+      while (Date.now() - pollStart < 8000) {
+        await sleep(300);
+        const captured = await readCapturedContent(page);
+        if (captured.length > 0) break;
+      }
 
-        // Also try API data (if available and more complete)
-        const apiParas = await readWeReadChapterData(page);
-        const bestParas = (apiParas.length > paragraphs.length) ? apiParas : paragraphs;
+      // Click "下一页" (next page) repeatedly until no more pages
+      // WeRead splits long chapters into multiple pages in scroll mode
+      let pageNum = 1;
+      while (pageNum < 100) { // safety limit
+        // Scroll to bottom to reveal the "下一页" button
+        await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+        await sleep(500);
 
-        if (bestParas.length > 0) {
-          chapters.push({ title: chapterTitle, paragraphs: bestParas });
-          const totalChars = bestParas.join('').length;
-          process.stderr.write(` ${bestParas.length} paras, ${totalChars} chars\n`);
-        } else {
-          process.stderr.write(` no content\n`);
+        // Check for "下一页" button
+        const nextBtn = await page.$('button.readerFooter_button');
+        if (!nextBtn) break;
+
+        const btnText = await nextBtn.evaluate(el => el.textContent?.trim());
+        if (!btnText || !btnText.includes('下一页')) break;
+
+        // Click it
+        const prevCount = (await readCapturedContent(page)).length;
+        await nextBtn.click();
+        pageNum++;
+
+        // Wait for new preRenderContainer to appear
+        const pageStart = Date.now();
+        while (Date.now() - pageStart < 8000) {
+          await sleep(300);
+          const current = await readCapturedContent(page);
+          if (current.length > prevCount) break;
         }
+        await sleep(500);
+      }
+
+      // Final read of all captured content across all pages
+      const paragraphs = await readCapturedContent(page);
+
+      if (paragraphs.length > 0) {
+        chapters.push({ title: chapterTitle, paragraphs });
+        const totalChars = paragraphs.join('').length;
+        const pageInfo = pageNum > 1 ? ` (${pageNum} pages)` : '';
+        process.stderr.write(` ${paragraphs.length} paras, ${totalChars} chars${pageInfo}\n`);
       } else {
-        process.stderr.write(` no layout data\n`);
+        process.stderr.write(` no content\n`);
       }
     }
 
@@ -2145,6 +2580,8 @@ async function main() {
 
   if (!source || !['kindle', 'weread'].includes(source)) {
     console.error('Usage: node scripts/sync-books.js <kindle|weread> [--max N] [--list] [--book "title"]');
+    console.error('       node scripts/sync-books.js weread --search "keyword"');
+    console.error('       node scripts/sync-books.js weread --add-shelf "readerBookId"');
     console.error('');
     console.error('Examples:');
     console.error('  node scripts/sync-books.js kindle              # Sync all Kindle books');
@@ -2152,6 +2589,8 @@ async function main() {
     console.error('  node scripts/sync-books.js kindle --list        # List books without syncing');
     console.error('  node scripts/sync-books.js kindle --book "书名"  # Sync only the matching book');
     console.error('  node scripts/sync-books.js weread               # Sync from WeRead');
+    console.error('  node scripts/sync-books.js weread --search "三体" # Search WeRead for a book');
+    console.error('  node scripts/sync-books.js weread --add-shelf "abc123" # Add book to WeRead shelf');
     process.exit(1);
   }
 
@@ -2160,6 +2599,10 @@ async function main() {
   const listOnly = args.includes('--list');
   const bookIdx = args.indexOf('--book');
   const bookFilter = bookIdx >= 0 ? args[bookIdx + 1] : null;
+  const searchIdx = args.indexOf('--search');
+  const searchKeyword = searchIdx >= 0 ? args[searchIdx + 1] : null;
+  const addShelfIdx = args.indexOf('--add-shelf');
+  const addShelfId = addShelfIdx >= 0 ? args[addShelfIdx + 1] : null;
   const emailIdx = args.indexOf('--email');
   const passwordIdx = args.indexOf('--password');
   const credentials = (emailIdx >= 0 && passwordIdx >= 0)
@@ -2168,49 +2611,93 @@ async function main() {
 
   // Step 0: Auto-setup — install dependencies + build extension if needed
   ensureDependencies();
-  const extPath = ensureExtensionBuilt();
+
+  // Search and add-shelf don't need the extension — skip extension build/load for speed
+  const needsExtension = !searchKeyword && !addShelfId;
+  const extPath = needsExtension ? ensureExtensionBuilt() : null;
 
   // Ensure library directory exists
   fs.mkdirSync(LIBRARY_PATH, { recursive: true });
 
   let browser;
   try {
-    // Step 2: Launch Chrome with extension (uses same profile as sync-login.js, login session preserved)
-    browser = await launchChrome(extPath);
+    // Launch Chrome — with extension only when needed (sync needs it, search/add-shelf don't)
+    if (needsExtension) {
+      browser = await launchChrome(extPath);
+    } else {
+      // Lightweight Chrome launch without extension
+      process.stderr.write('Launching Chrome (no extension needed)...\n');
+      browser = await puppeteer.launch({
+        headless: false,
+        protocolTimeout: 600_000,
+        args: [
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--disable-popup-blocking',
+        ],
+        userDataDir: CHROME_PROFILE,
+      });
+    }
     _activeBrowser = browser;
 
-    // Step 3: Find extension
-    process.stderr.write('Finding CastReader extension...\n');
-    const extId = await findExtensionId(browser);
-    process.stderr.write(`Extension ID: ${extId}\n`);
+    let extId = null;
+    if (needsExtension) {
+      // Find extension (only needed for sync)
+      process.stderr.write('Finding CastReader extension...\n');
+      extId = await findExtensionId(browser);
+      process.stderr.write(`Extension ID: ${extId}\n`);
+    }
 
-    // Step 4: Navigate to library
-    const urls = {
-      kindle: 'https://read.amazon.com/kindle-library',
-      weread: 'https://weread.qq.com/web/shelf',
-    };
-    process.stderr.write(`Navigating to ${urls[source]}...\n`);
+    // Navigate to initial page
     const page = await browser.newPage();
-    // Kindle: large viewport = fewer pages = faster sync. WeRead: normal size.
     const isKindle = source === 'kindle';
     await page.setViewport({ width: isKindle ? 1920 : 1280, height: isKindle ? 2400 : 900 });
-    await page.goto(urls[source], { waitUntil: 'networkidle2', timeout: 60000 });
 
-    // Step 5: Source-specific sync flow
+    // Navigate directly to the target page (skip shelf for search — saves ~8s)
+    const initialUrl = searchKeyword
+      ? `https://weread.qq.com/web/search/books?keyword=${encodeURIComponent(searchKeyword)}`
+      : addShelfId
+      ? `https://weread.qq.com/web/reader/${addShelfId}`
+      : (isKindle ? 'https://read.amazon.com/kindle-library' : 'https://weread.qq.com/web/shelf');
+    process.stderr.write(`Navigating to ${initialUrl}...\n`);
+    await page.goto(initialUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+
+    // Step 5: Source-specific flow
     let result;
-    if (source === 'kindle') {
+
+    if (source === 'weread' && searchKeyword) {
+      // WeRead search flow: already navigated directly to search URL
+      // Check if login is needed (redirected away from search page)
+      const currentUrl = page.url();
+      if (!currentUrl.includes('/web/search/')) {
+        // Got redirected — need login. Go to shelf for login flow.
+        await page.goto('https://weread.qq.com/web/shelf', { waitUntil: 'networkidle2', timeout: 60000 });
+        const loggedIn = await waitForLogin(page, 'weread');
+        if (!loggedIn) { console.error('Login timed out.'); process.exit(1); }
+        // Now navigate to search
+        result = await searchWeRead(page, searchKeyword);
+      } else {
+        // Already on search page — just parse results
+        result = await searchWeReadFromCurrentPage(page, searchKeyword);
+      }
+    } else if (source === 'weread' && addShelfId) {
+      // WeRead add-to-shelf flow: already navigated directly to book page
+      result = await addToWeReadShelf(page, addShelfId);
+    } else if (source === 'kindle') {
       result = await syncKindle(browser, extId, page, maxBooks, { listOnly, bookFilter, credentials });
     } else {
       result = await syncWeRead(browser, extId, page, maxBooks, { listOnly, bookFilter });
     }
 
-    // Output result
-    console.log(JSON.stringify({
-      success: true,
-      source,
-      ...result,
-      libraryPath: LIBRARY_PATH,
-    }));
+    // Output result (search/add-shelf already output their own JSON)
+    if (!searchKeyword && !addShelfId) {
+      console.log(JSON.stringify({
+        success: true,
+        source,
+        ...result,
+        libraryPath: LIBRARY_PATH,
+      }));
+    }
 
   } finally {
     _activeBrowser = null;
