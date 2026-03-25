@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * search-book.js — Search book content locally (no browser needed)
+ * search-book.js — Search book content locally + online (no browser needed)
  *
  * Usage:
  *   node scripts/search-book.js <bookId> --grep "keyword"     # Search all chapters for keyword
@@ -9,8 +9,11 @@
  *   node scripts/search-book.js <bookId> --read 5-8            # Read chapters 5 through 8
  *   node scripts/search-book.js <bookId> --read all            # Read entire book (full.md)
  *   node scripts/search-book.js <bookId> --summary             # Book overview: meta + chapter list
+ *   node scripts/search-book.js --online "keyword"             # Search WeRead online (no Puppeteer, <1s)
+ *   node scripts/search-book.js --find "keyword"               # Local first, online fallback (best for skill)
+ *   node scripts/search-book.js --shelf                        # List all local books
  *
- * All output is JSON to stdout. Instant — no network, no browser.
+ * All output is JSON to stdout. Local ops are instant. Online search <1s (direct API).
  */
 
 const fs = require('fs');
@@ -34,28 +37,61 @@ function main() {
   let bookDir = path.join(LIBRARY_PATH, 'books', bookId);
 
   if (!fs.existsSync(bookDir)) {
-    // Try fuzzy match: exact substring first, then partial match
     const booksDir = path.join(LIBRARY_PATH, 'books');
-    if (fs.existsSync(booksDir)) {
-      const dirs = fs.readdirSync(booksDir);
-      // Exact substring match (bookId appears in dir name, or dir name appears in bookId)
-      const matches = dirs.filter(d => d.includes(bookId) || bookId.includes(d));
-      if (matches.length === 1) {
-        // Single match — auto-resolve
-        bookDir = path.join(booksDir, matches[0]);
-        process.stderr.write(`Resolved "${bookId}" → "${matches[0]}"\n`);
-      } else if (matches.length > 1) {
-        // Multiple matches — pick best (shortest name = closest match)
-        matches.sort((a, b) => a.length - b.length);
-        bookDir = path.join(booksDir, matches[0]);
-        process.stderr.write(`Resolved "${bookId}" → "${matches[0]}" (${matches.length} candidates)\n`);
-      } else {
-        console.error(`Book "${bookId}" not found. Available books:`);
-        dirs.forEach(d => console.error(`  - ${d}`));
-        process.exit(1);
-      }
-    } else {
+    if (!fs.existsSync(booksDir)) {
       console.error(`Library not found at ${booksDir}`);
+      process.exit(1);
+    }
+    const dirs = fs.readdirSync(booksDir);
+    // Also load meta.json titles for better matching
+    const dirsWithMeta = dirs.map(d => {
+      let title = '';
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(booksDir, d, 'meta.json'), 'utf-8'));
+        title = meta.title || '';
+      } catch {}
+      return { dir: d, title };
+    });
+
+    // Normalize query: lowercase, spaces→hyphens for dir matching
+    const q = bookId.toLowerCase();
+    const qDash = q.replace(/\s+/g, '-');
+
+    // Score each book: higher = better match
+    function score(entry) {
+      const d = entry.dir.toLowerCase();
+      const t = entry.title.toLowerCase();
+      // Exact dir name match
+      if (d === q || d === qDash) return 100;
+      // Title exact match
+      if (t === q) return 90;
+      // Title starts with query
+      if (t.startsWith(q)) return 80;
+      // Dir starts with query (before first -)
+      const dirName = d.split('-')[0];
+      if (dirName === q || dirName === qDash) return 75;
+      // Query is substring of title
+      if (t.includes(q)) return 70;
+      // Query is substring of dir
+      if (d.includes(q) || d.includes(qDash)) return 60;
+      // Title is substring of query
+      if (q.includes(t) && t.length > 1) return 50;
+      // Dir name (first segment) is substring of query
+      if (q.includes(dirName) && dirName.length > 1) return 40;
+      return 0;
+    }
+
+    const scored = dirsWithMeta.map(e => ({ ...e, score: score(e) }))
+      .filter(e => e.score > 0)
+      .sort((a, b) => b.score - a.score || a.dir.length - b.dir.length);
+
+    if (scored.length > 0) {
+      bookDir = path.join(booksDir, scored[0].dir);
+      const label = scored[0].title || scored[0].dir;
+      process.stderr.write(`Resolved "${bookId}" → "${label}"\n`);
+    } else {
+      console.error(`Book "${bookId}" not found. Available books:`);
+      dirsWithMeta.forEach(e => console.error(`  - ${e.title || e.dir}`));
       process.exit(1);
     }
   }
@@ -249,4 +285,161 @@ function doSummary(bookDir, chapterFiles, meta) {
   }, null, 2));
 }
 
-main();
+// ---- Online Search (WeRead API, no Puppeteer) ----
+
+async function doOnlineSearch(keyword) {
+  const https = require('https');
+  // Use the HTML search page — it contains readerBookId (needed for --add-shelf and sync)
+  const parsedUrl = new URL(`https://weread.qq.com/web/search/books?keyword=${encodeURIComponent(keyword)}`);
+  const opts = {
+    hostname: parsedUrl.hostname,
+    path: parsedUrl.pathname + parsedUrl.search,
+    headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' },
+  };
+
+  return new Promise((resolve, reject) => {
+    https.get(opts, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        // Parse SSR-rendered book list: split by <li class="wr_bookList_item">
+        const books = [];
+        const items = data.split('<li class="wr_bookList_item">');
+        for (let i = 1; i < items.length && books.length < 10; i++) {
+          const chunk = items[i];
+          const hrefMatch = chunk.match(/href="\/web\/(?:reader|bookDetail)\/([^"]+)"/);
+          if (!hrefMatch) continue;
+          const readerBookId = hrefMatch[1].trim();
+
+          const titleMatch = chunk.match(/wr_bookList_item_title"[^>]*>([\s\S]*?)<\/p>/);
+          const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : '';
+
+          const authorMatch = chunk.match(/wr_bookList_item_author"[^>]*>([\s\S]*?)<\/p>/);
+          const author = authorMatch ? authorMatch[1].replace(/<[^>]+>/g, '').trim() : '';
+
+          const descMatch = chunk.match(/wr_bookList_item_desc"[^>]*>([\s\S]*?)<\/p>/);
+          const intro = descMatch ? descMatch[1].replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').trim().substring(0, 200) : '';
+
+          const ratingMatch = chunk.match(/wr_bookList_item_reading_percent"[^>]*>([\s\S]*?)<\/span>/);
+          const rating = ratingMatch ? ratingMatch[1].trim() : '';
+
+          if (title) {
+            books.push({ title, author, readerBookId, intro, rating,
+              readerUrl: `https://weread.qq.com/web/reader/${readerBookId}` });
+          }
+        }
+
+        console.log(JSON.stringify({
+          event: 'search_results',
+          keyword,
+          totalCount: books.length,
+          books,
+        }, null, 2));
+        resolve();
+      });
+    }).on('error', (e) => {
+      console.error(`Search request failed: ${e.message}`);
+      process.exit(1);
+    });
+  });
+}
+
+// ---- Find: local first, online fallback ----
+
+async function doFind(keyword) {
+  // Try local fuzzy match first
+  const booksDir = path.join(LIBRARY_PATH, 'books');
+  if (fs.existsSync(booksDir)) {
+    const dirs = fs.readdirSync(booksDir);
+    const dirsWithMeta = dirs.map(d => {
+      let title = '', author = '', meta = {};
+      try {
+        meta = JSON.parse(fs.readFileSync(path.join(booksDir, d, 'meta.json'), 'utf-8'));
+        title = meta.title || '';
+        author = meta.author || '';
+      } catch {}
+      return { dir: d, title, author, meta };
+    });
+
+    const q = keyword.toLowerCase();
+    const matches = dirsWithMeta.filter(e => {
+      const t = e.title.toLowerCase();
+      const d = e.dir.toLowerCase();
+      return t.includes(q) || d.includes(q) || q.includes(t);
+    });
+
+    if (matches.length > 0) {
+      // Best local match — return summary
+      const best = matches[0];
+      const bookDir = path.join(booksDir, best.dir);
+      const chapterFiles = fs.readdirSync(bookDir)
+        .filter(f => /^chapter-\d+\.md$/.test(f))
+        .sort((a, b) => parseInt(a.match(/\d+/)[0]) - parseInt(b.match(/\d+/)[0]));
+
+      const chapters = chapterFiles.map(file => {
+        const num = parseInt(file.match(/\d+/)[0]);
+        const content = fs.readFileSync(path.join(bookDir, file), 'utf-8');
+        const title = content.split('\n')[0]?.replace(/^#+\s*/, '').trim() || `Chapter ${num}`;
+        return { chapter: num, title, chars: content.length };
+      });
+
+      console.log(JSON.stringify({
+        event: 'local_hit',
+        bookDir: best.dir,
+        title: best.meta.title || best.dir,
+        author: best.meta.author || 'Unknown',
+        source: best.meta.source || 'unknown',
+        language: best.meta.language || 'unknown',
+        totalChapters: chapters.length,
+        totalChars: chapters.reduce((s, c) => s + c.chars, 0),
+        syncedAt: best.meta.syncedAt || 'unknown',
+        chapters,
+      }, null, 2));
+      return;
+    }
+  }
+
+  // No local match — search online
+  process.stderr.write(`Not found locally, searching WeRead...\n`);
+  await doOnlineSearch(keyword);
+}
+
+// ---- Shelf: list all local books ----
+
+function doShelf() {
+  const indexPath = path.join(LIBRARY_PATH, 'index.json');
+  if (!fs.existsSync(indexPath)) {
+    console.log(JSON.stringify({ event: 'shelf', books: [] }));
+    return;
+  }
+  const index = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
+  const books = (index.books || []).map(b => ({
+    title: b.title || '',
+    author: b.author || '',
+    source: b.source || '',
+    dirName: b.dirName || '',
+    totalChapters: b.totalChapters || 0,
+    totalCharacters: b.totalCharacters || 0,
+  }));
+  console.log(JSON.stringify({ event: 'shelf', totalBooks: books.length, books }, null, 2));
+}
+
+// ---- Main ----
+
+const args = process.argv.slice(2);
+
+if (args.includes('--online')) {
+  const idx = args.indexOf('--online');
+  const kw = args[idx + 1];
+  if (!kw) { console.error('Usage: --online "keyword"'); process.exit(1); }
+  doOnlineSearch(kw).catch(e => { console.error(e); process.exit(1); });
+} else if (args.includes('--find')) {
+  const idx = args.indexOf('--find');
+  const kw = args[idx + 1];
+  if (!kw) { console.error('Usage: --find "keyword"'); process.exit(1); }
+  doFind(kw).catch(e => { console.error(e); process.exit(1); });
+} else if (args.includes('--shelf')) {
+  doShelf();
+} else {
+  main();
+}

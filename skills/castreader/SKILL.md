@@ -57,7 +57,9 @@ Users need to understand the reason behind each step. Don't just say "logging in
 ### Rule 2: Tell WHAT + HOW LONG before starting
 
 Every operation MUST be announced before running:
-- Listing books: "~30 seconds"
+- Local book lookup / read chapter / grep: instant, no announcement needed
+- Online search (WeRead): "~10 seconds"
+- Listing books from cloud: "~30 seconds"
 - Syncing a short book (<20 chapters): "1-3 minutes"
 - Syncing a long book (>50 chapters): "5-10 minutes"
 - Generating audio: "~1 minute"
@@ -85,15 +87,36 @@ Syncing "A Journey to the Centre of the Earth" now. This usually takes 2-3 minut
 
 ---
 
-## SPEED RULES — Minimize API round-trips
+## SPEED RULES — Every second counts
 
-**Every tool call costs 3-5 seconds. Combine steps aggressively.**
+**Users are on their phones waiting. Every agent turn takes 3-10 seconds of LLM processing.**
 
-1. **NEVER check local library THEN search online as two separate turns.** Instead: run ONE bash command that checks local AND searches if not found.
-2. **NEVER explain what you're about to do, then do it in a separate turn.** Combine the explanation message AND the tool call in the SAME turn.
-3. **Prefer `search-book.js` over `cat` for all book operations** — it's faster and outputs structured JSON.
-4. **Batch reads**: Use `--read 5-8` to read multiple chapters in one call, not chapter by chapter.
-5. **When user says a book name**: immediately run the search/check — don't ask clarifying questions first.
+### Rule S1: Message + Tool in SAME turn
+ALWAYS send a user-facing message AND run the tool call in the SAME turn. Never split "I'm going to search..." and the actual search into two turns.
+
+### Rule S2: One bash call per turn
+Combine related operations into ONE bash command. Never run two sequential bash calls when one will do.
+
+### Rule S3: Fuzzy book name matching
+`search-book.js` accepts fuzzy names: "悉达多" matches "悉达多（知书经典）", "hold on" matches "Hold On To Me...". Always try local first.
+
+### Rule S4: No clarification before search
+When user says a book name, IMMEDIATELY search — don't ask "which book?" first. If ambiguous, show results and ask.
+
+### Rule S5: Batch reads
+Use `--read 5-8` to read multiple chapters in one call. Never read chapter by chapter.
+
+### Timing reference (tell user these estimates)
+| Operation | Time | User sees |
+|-----------|------|-----------|
+| Local book lookup (`--find`) | <0.2s | instant |
+| Online search (`--find` fallback) | <1s | instant |
+| Read chapter | <0.2s | instant |
+| Grep search | <0.2s | instant |
+| Shelf list (`--shelf`) | <0.1s | instant |
+| Sync book (<20 chapters) | 1-3min | "同步中，约1-3分钟..." |
+| Sync book (>50 chapters) | 5-10min | "同步中，约5-10分钟..." |
+| Generate TTS audio | ~1min | "生成语音中，约1分钟..." |
 
 ---
 
@@ -101,20 +124,20 @@ Syncing "A Journey to the Centre of the Earth" now. This usually takes 2-3 minut
 
 ### Entry Point — User mentions a book title
 
-**Do this in ONE turn (one bash tool call):**
+**ONE command does everything — local lookup + online fallback:**
 
 ```bash
-# Check local first, search WeRead if not found — ALL IN ONE COMMAND
-LOCAL=$(node scripts/search-book.js "书名关键词" --summary 2>/dev/null); if [ $? -eq 0 ]; then echo "$LOCAL"; else node scripts/sync-books.js weread --search "书名关键词"; fi
+node scripts/search-book.js --find "书名关键词"
 ```
 
-- Local hit → show summary + TOC, ask where to start
-- Local miss → show search results, ask which one
+**Handle result (check `event` field):**
+- `"local_hit"` → book found locally (instant, <0.2s). Show TOC + ask where to start.
+- `"search_results"` → not local, online results returned (<1s). Show list, ask which one.
 
 ### Show Local Book List
 
-```
-cat ~/castreader-library/index.json 2>/dev/null || echo '{"books":[]}'
+```bash
+node scripts/search-book.js --shelf
 ```
 
 Format as numbered list, then ask which one to read.
@@ -147,20 +170,21 @@ For multiple consecutive chapters: `--read 5-8`
 node scripts/search-book.js <bookId> --grep "关键词"
 ```
 
-This searches ALL chapters instantly (<1 second) and returns matching lines with context.
-Then read only the specific chapter(s) that matched:
+Searches ALL chapters instantly (<0.2s). Then read only matched chapters:
 
 ```
 node scripts/search-book.js <bookId> --read <matched-chapter-number>
 ```
 
-### Read Aloud (user says "read it aloud" / "listen")
+### Read Aloud (user says "read it aloud" / "念给我听" / "listen")
 
-**Tell user first:** "Generating audio for this chapter, about 1 minute..."
+**In ONE turn: send "生成语音中，约1分钟..." + run generate command.**
 
-1. Save chapter to temp file
-2. Generate: `node scripts/generate-text.js /tmp/castreader-chapter.txt <language>`
-3. Send MP3 via message tool
+```bash
+node scripts/search-book.js <bookId> --read <N> 2>/dev/null | python3 -c "import sys,json; open('/tmp/castreader-chapter.txt','w').write(json.load(sys.stdin)['content'])" && node scripts/generate-text.js /tmp/castreader-chapter.txt <language>
+```
+
+Then send the MP3 via message tool.
 
 ---
 
@@ -227,20 +251,19 @@ After sync complete → Show table of contents, ask where to start reading.
 
 ## Search & Add Book (WeRead only)
 
-When user mentions a book that's NOT in the local library (e.g., "我想看三体", "帮我找一本书"), use this flow:
+When user mentions a book that's NOT in the local library (e.g., "我想看三体", "帮我找一本书"), the `--find` command already handles this. If `event` is `"search_results"`:
 
-### Step 1: Search
+### Step 1: Show results
 
-**Tell user:** "正在微信读书搜索《书名》..."
+The `--find` command already returned search results. Show numbered list with title, author, and intro. Ask user to pick one.
+
+If you need to search again with different keywords:
 
 ```
-node scripts/sync-books.js weread --search "关键词"
+node scripts/search-book.js --online "新关键词"
 ```
 
-**Handle output:**
-- `{"event":"search_results","keyword":"...","books":[...]}` → Show numbered list with title, author, and intro (if available). Ask user to pick one.
-- `{"event":"wechat_qr","screenshot":"..."}` → Login needed first. Send QR image to user, wait for login, then re-run search.
-- No results → Tell user, suggest different keywords.
+This uses WeRead's public API directly (<1s, no login needed, no Puppeteer).
 
 **STOP. Wait for user to pick a book.**
 
