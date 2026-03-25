@@ -61,6 +61,7 @@ function main() {
     function score(entry) {
       const d = entry.dir.toLowerCase();
       const t = entry.title.toLowerCase();
+      const a = entry.author.toLowerCase();
       // Exact dir name match
       if (d === q || d === qDash) return 100;
       // Title exact match
@@ -72,6 +73,8 @@ function main() {
       if (dirName === q || dirName === qDash) return 75;
       // Query is substring of title
       if (t.includes(q)) return 70;
+      // Author match
+      if (a.includes(q)) return 65;
       // Query is substring of dir
       if (d.includes(q) || d.includes(qDash)) return 60;
       // Title is substring of query
@@ -365,7 +368,8 @@ async function doFind(keyword) {
     const matches = dirsWithMeta.filter(e => {
       const t = e.title.toLowerCase();
       const d = e.dir.toLowerCase();
-      return t.includes(q) || d.includes(q) || q.includes(t);
+      const a = e.author.toLowerCase();
+      return t.includes(q) || d.includes(q) || a.includes(q) || q.includes(t);
     });
 
     if (matches.length > 0) {

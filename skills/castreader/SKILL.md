@@ -3,7 +3,7 @@ name: castreader
 description: >
   Read books together with AI. Pick a book from your Kindle or WeRead library,
   discuss chapter by chapter, and listen aloud.
-version: 3.4.0
+version: 3.5.0
 metadata:
   openclaw:
     emoji: "📖"
@@ -58,7 +58,7 @@ Users need to understand the reason behind each step. Don't just say "logging in
 
 Every operation MUST be announced before running:
 - Local book lookup / read chapter / grep: instant, no announcement needed
-- Online search (WeRead): "~10 seconds"
+- Online search (WeRead): instant (<1s), no announcement needed
 - Listing books from cloud: "~30 seconds"
 - Syncing a short book (<20 chapters): "1-3 minutes"
 - Syncing a long book (>50 chapters): "5-10 minutes"
@@ -98,7 +98,13 @@ ALWAYS send a user-facing message AND run the tool call in the SAME turn. Never 
 Combine related operations into ONE bash command. Never run two sequential bash calls when one will do.
 
 ### Rule S3: Fuzzy book name matching
-`search-book.js` accepts fuzzy names: "悉达多" matches "悉达多（知书经典）", "hold on" matches "Hold On To Me...". Always try local first.
+`search-book.js` accepts fuzzy names — title, author, or partial match. Examples:
+- "悉达多" → "悉达多（知书经典）"
+- "hold on" → "Hold On To Me: Love Rekindled..."
+- "刘慈欣" → "三体前传：球状闪电 弦" (author match)
+- "地下室" → "地下室手记：陀思妥耶夫斯基中短篇小说集..."
+
+Always try local first via `--find`.
 
 ### Rule S4: No clarification before search
 When user says a book name, IMMEDIATELY search — don't ask "which book?" first. If ambiguous, show results and ask.
@@ -109,14 +115,42 @@ Use `--read 5-8` to read multiple chapters in one call. Never read chapter by ch
 ### Timing reference (tell user these estimates)
 | Operation | Time | User sees |
 |-----------|------|-----------|
-| Local book lookup (`--find`) | <0.2s | instant |
-| Online search (`--find` fallback) | <1s | instant |
-| Read chapter | <0.2s | instant |
-| Grep search | <0.2s | instant |
-| Shelf list (`--shelf`) | <0.1s | instant |
+| Local book lookup (`--find`) | ~100ms | instant |
+| Online search (`--find` fallback / `--online`) | ~650ms | instant |
+| Read chapter | ~80ms | instant |
+| Grep search | ~90ms | instant |
+| Shelf list (`--shelf`) | ~100ms | instant |
 | Sync book (<20 chapters) | 1-3min | "同步中，约1-3分钟..." |
 | Sync book (>50 chapters) | 5-10min | "同步中，约5-10分钟..." |
 | Generate TTS audio | ~1min | "生成语音中，约1分钟..." |
+
+---
+
+## Tool Reference: search-book.js
+
+All-in-one book tool. No browser, no Puppeteer. All output is JSON to stdout.
+
+```
+node scripts/search-book.js --find "书名或作者"       # Local first, online fallback (<1s)
+node scripts/search-book.js --online "关键词"         # WeRead online search only (<1s)
+node scripts/search-book.js --shelf                  # List all local books
+node scripts/search-book.js <bookId> --summary       # Book overview + chapter list
+node scripts/search-book.js <bookId> --read <N>      # Read chapter N
+node scripts/search-book.js <bookId> --read <N-M>    # Read chapters N through M
+node scripts/search-book.js <bookId> --read all      # Read entire book
+node scripts/search-book.js <bookId> --grep "keyword" # Search all chapters
+node scripts/search-book.js <bookId> --chapters      # Chapter list with char counts
+```
+
+**bookId** accepts fuzzy names — title fragments, author names, or directory names all work.
+
+**Output `event` field values:**
+- `"local_hit"` — found locally, includes full chapter list
+- `"search_results"` — online results, includes `readerBookId` for each book
+- `"shelf"` — local book list
+- `"summary"` — book overview
+- `"read"` — chapter content
+- `"grep_results"` — search matches with context
 
 ---
 
@@ -131,8 +165,8 @@ node scripts/search-book.js --find "书名关键词"
 ```
 
 **Handle result (check `event` field):**
-- `"local_hit"` → book found locally (instant, <0.2s). Show TOC + ask where to start.
-- `"search_results"` → not local, online results returned (<1s). Show list, ask which one.
+- `"local_hit"` → book found locally (instant). Show TOC + ask where to start.
+- `"search_results"` → not local, online results (<1s). Show list, ask which one.
 
 ### Show Local Book List
 
@@ -164,13 +198,13 @@ For multiple consecutive chapters: `--read 5-8`
 
 ### Search Book Content (user asks "find the scene where..." / "哪一章提到了...")
 
-**IMPORTANT: Do NOT read chapters one by one to search. Use `search-book.js --grep` instead.**
+**IMPORTANT: Do NOT read chapters one by one to search. Use --grep instead.**
 
 ```
 node scripts/search-book.js <bookId> --grep "关键词"
 ```
 
-Searches ALL chapters instantly (<0.2s). Then read only matched chapters:
+Searches ALL chapters instantly (<0.1s). Then read only matched chapters:
 
 ```
 node scripts/search-book.js <bookId> --read <matched-chapter-number>
@@ -255,7 +289,7 @@ When user mentions a book that's NOT in the local library (e.g., "我想看三�
 
 ### Step 1: Show results
 
-The `--find` command already returned search results. Show numbered list with title, author, and intro. Ask user to pick one.
+The `--find` command already returned search results with `readerBookId`. Show numbered list with title, author, and intro. Ask user to pick one.
 
 If you need to search again with different keywords:
 
@@ -263,7 +297,7 @@ If you need to search again with different keywords:
 node scripts/search-book.js --online "新关键词"
 ```
 
-This uses WeRead's public API directly (<1s, no login needed, no Puppeteer).
+This uses WeRead's public search page directly (<1s, no login needed, no Puppeteer).
 
 **STOP. Wait for user to pick a book.**
 
@@ -288,18 +322,21 @@ After sync → Show table of contents, start reading together.
 ### Combined Example
 
 ```
-User: "我想看三体"
-Bot: "正在微信读书搜索《三体》..."
-     → runs --search "三体"
-     → "找到以下结果：\n1. 三体 - 刘慈欣\n2. 三体II：黑暗森林 - 刘慈欣\n..."
-     → "你想看哪一本？"
+User: "我想看活着"
+Bot:  [runs --find "活着" — gets search_results in <1s]
+      "找到以下结果：
+       1. 活着 - 余华 (92.0%)
+       2. 活着：清影纪录中国2011 - 清影工作室
+       ...
+       你想看哪一本？"
 
 User: "第一个"
-Bot: "正在将《三体》加入你的书架..."
-     → runs --add-shelf "readerBookId"
-     → "已加入书架！正在同步内容，大约需要 1-2 分钟..."
-     → runs --book "三体"
-     → Shows TOC, starts reading
+Bot:  "正在将《活着》加入你的书架并同步，约1-2分钟..."
+      [runs --add-shelf + --book in ONE bash call]
+      "✅ 同步完成！共12章。
+       1. 版权信息
+       2. 有庆...
+       从哪一章开始？"
 ```
 
 ---
